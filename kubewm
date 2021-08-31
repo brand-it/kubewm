@@ -1,0 +1,249 @@
+#!/usr/bin/env ruby
+#
+# Log into teleport and shell into worker pod. Will also install missing tools if you don't have them
+#
+# Install this script
+# wget -O /usr/local/bin/kubewm https://gist.githubusercontent.com/brand-it/30e8d7bbe96599313cf0f8202f9559af/raw/c98491838a3ff9e0cbb7e16ff1c8740c4e8684bf/kubewm
+# chmod 755 /usr/local/bin/kubewm
+#
+
+require 'json'
+require 'optparse'
+
+module Kubewm
+  KNOWN_NAMESPACES = %w[admin api-gateway-internal api-gateway-public api-gateway-ws argo-cd
+                        argo-rollouts argocd content-policy-reporter convergence core embedded-ecommerce
+                        embedded-ecommerce-api embeds exchange exchange-fe imgproc istio-operator
+                        istio-system kube-system logistics-service moonshot optimizely-agent
+                        orders-fe project-monitoring rbac-manager segment-optimizely-pipeline
+                        teleport traefik-int traefik-internal traefik-pub traefik-public vault-webhook
+                        weedmaps-apex weedmaps-api].freeze
+  class Kubectl
+    class << self
+      def install
+        return if exists?
+
+        puts "\033[0;34mInstalling kubectl\033[0m"
+        `wget -O /usr/local/bin/kubectl "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/darwin/amd64/kubectl"`
+        `chmod 755 /usr/local/bin/kubectl`
+      end
+
+      def exists?
+        `which kubectl` != ''
+      end
+    end
+  end
+
+  class Teleport
+    class << self
+      def install
+        return if exists?
+
+        puts "\033[0;34mInstalling Teleport\033[0m"
+        return system('brew install teleport') if brew?
+
+        Errors.add('Brew is required to install Teleport')
+      end
+
+      def exists?
+        `which tsh` != ''
+      end
+
+      def brew?
+        `which brew` != ''
+      end
+
+      def login(username, environment, cluster = 'weedmaps')
+        proxy = "teleport-eks-#{cluster}-#{environment}.internal-weedmaps.com"
+
+        return if logged_in?(proxy)
+        return Errors.add('"username" is required, can\'t be blank') if username.to_s == ''
+
+        `tsh --proxy=#{proxy} --auth=github --user="#{username}" login`
+        return if logged_in?(proxy)
+
+        Kubewm::Errors.add("failed to loggin using teleport might be the username(#{username}) or the environment(#{environment}) that are incorrect")
+        Kubewm::Errors.add('Could also be because the VPN is not connected')
+      end
+
+      def logged_in?(proxy)
+        `tsh kube ls`.include?(proxy)
+      end
+    end
+  end
+
+  class Errors
+    @messages = []
+    class << self
+      attr_reader :messages
+
+      def add(value)
+        @messages << value
+      end
+
+      def display_and_abort
+        return if messages.empty?
+
+        puts ArgsParser.new.option_parser
+        puts "\033[0;31mErrors:"
+        messages.each do |message|
+          puts "\033[0;31m    #{message}\033[0m"
+        end
+
+        exit 1
+      end
+    end
+  end
+
+  class PodsFinder
+    attr_reader :app, :pod_names, :fail_fast
+
+    POD_NAMES = %w[utility sidekiq].freeze
+
+    def initialize(app:, pod_name: nil, fail_fast:)
+      @app = app
+      @pod_names = ([pod_name] + POD_NAMES).compact
+      @fail_fast = fail_fast
+    end
+
+    def pod(name = pod_names.shift)
+      return @pod if @pod || name.nil?
+
+      puts "\033[0;34mlooking for a pod containing the name '#{name}'\033[0m"
+      @pod = pods.find { |item| item.metadata.name.include?(name) }
+      return @pod if fail_fast
+      @pod || pod(pod_names.shift)
+    end
+
+    def pods
+      @pods ||= JSON.parse(`kubectl -o json -n "#{app}" get pods`, object_class: OpenStruct).items.select do |item|
+        item.status.phase == 'Running' || fail_fast
+      end
+    rescue JSON::ParserError
+      Errors.add("Could not get pods for #{app}")
+      @pods = []
+    end
+  end
+
+  class ArgsParser
+    CONFIG_FILE = File.expand_path('~/.kubewm')
+    COMMAND_NAME = File.basename(__FILE__)
+
+    def option_parser
+      OptionParser.new do |opts|
+        opts.banner = "Usage: #{COMMAND_NAME} app environment [options]"
+
+        opts.on('-a', '--app [APP]', '[Required] The name of the app that your trying to access') do |value|
+          options[:app] = value.strip
+        end
+
+        opts.on('-e', '--environment [ENVIRONMENT]', '[Required] acceptance, staging, or production') do |value|
+          options[:environment] = -> { value.strip }
+        end
+
+        opts.on('-p', '--pod [POD_NAME]', '[Optional] Find pod where name includes') do |value|
+          Errors.add('"pod" can\'t be blank') if blank?(value)
+          options[:pod_name] = value.strip
+        end
+
+        opts.on(
+          '-u',
+          '--username [USERNAME]',
+          "[Require] If you provide a Teleport github username it will store it in #{CONFIG_FILE} and used for future logins"
+        ) do |value|
+          File.open(CONFIG_FILE, 'w') { |f| f.write(value.strip) }
+          options[:username] = value.strip
+        end
+
+        opts.on('-n', '--namespaces', 'Display the known namespaces that can be used for the --app command') do
+          puts 'Known namespaces:'
+          KNOWN_NAMESPACES.each do |namespace|
+            puts "    #{namespace}"
+          end
+          puts 'Going to try to list them out using `kubectl get ns` might work depending on your access settings'
+          puts `kubectl get ns`
+          exit
+        end
+
+        opts.on('-z', '--list-pods', 'Display the pods for the specified app and environment') do
+          options[:list_pods] = true
+        end
+
+        opts.on('-c', '--command', 'Run a custom command other then bash') do |value|
+          options[:command] = value
+        end
+
+        opts.on('-h', '--help', 'Prints this help') do
+          puts 'Examples:'
+          puts "    #{COMMAND_NAME} core acceptance"
+          puts "    #{COMMAND_NAME} weedmaps-api staging"
+          puts "    #{COMMAND_NAME} weedmaps-api staging logs -p preflight"
+          puts "    #{COMMAND_NAME} weedmaps-api staging 'bin/rails c'"
+          puts opts
+
+          exit
+        end
+      end
+    end
+
+    def parse!
+      option_parser.parse!
+      options[:app] = ARGV.shift
+      options[:environment] = ARGV.shift
+      options[:command] = ARGV.shift || 'bash'
+      validate!
+    end
+
+    def validate!
+      Errors.add('"app" is required, can\'t be blank') if blank?(options.app)
+      Errors.add('"environment" is required, can\'t be blank') if blank?(options.environment)
+      Errors.add('"username" is required, can\'t be blank') if blank?(options.username)
+    end
+
+    def options
+      @options ||= OpenStruct.new(
+        username: (File.read(CONFIG_FILE).strip if File.exist?(CONFIG_FILE)),
+        list_pods: false
+      )
+    end
+
+    private
+
+    def blank?(value)
+      value&.strip.to_s == ''
+    end
+  end
+end
+
+Kubewm::Kubectl.install
+Kubewm::Teleport.install
+Kubewm::Errors.display_and_abort
+
+args = Kubewm::ArgsParser.new.tap(&:parse!)
+
+Kubewm::Errors.display_and_abort
+
+Kubewm::Teleport.login(args.options.username, args.options.environment)
+
+Kubewm::Errors.display_and_abort
+pod_finder = Kubewm::PodsFinder.new(app: args.options.app, pod_name: args.options.pod_name, fail_fast: args.options.pod_name.to_s != '')
+if args.options.list_pods
+  puts "\033[0;34m#{`kubectl -n #{args.options.app} get pods`}\033[0m"
+  if pod_finder.pod
+    puts "\033[0;34mWould connect to #{pod_finder.pod.metadata.name}\033[0m"
+  else
+    puts "\033[0;31mCould not find a pod to connect to\033[0m"
+  end
+  exit
+end
+Kubewm::Errors.add('Could not find a pod to connect to use --pod and --list-pods to connect manual') if pod_finder.pod.nil?
+Kubewm::Errors.display_and_abort
+puts "\033[0;34mEstablishing a connection to #{args.options.app} #{args.options.environment} #{pod_finder.pod.metadata.name}\033[0m"
+puts "\033[0;34m#{`tsh kube ls`}\033[0m"
+if args.options.command == 'logs'
+  puts "\033[0;34mrunning: kubectl -n -f '#{args.options.app}' logs '#{pod_finder.pod.metadata.name}'\033[0m"
+  exec("kubectl -n '#{args.options.app}' logs '#{pod_finder.pod.metadata.name}' -f")
+else
+  puts "\033[0;34mrunning: kubectl -n '#{args.options.app}' exec -ti '#{pod_finder.pod.metadata.name}' -- /vault/vault-env #{args.options.command}\033[0m"
+  exec("kubectl -n '#{args.options.app}' exec -ti '#{pod_finder.pod.metadata.name}' -- /vault/vault-env #{args.options.command}")
+end
